@@ -1,0 +1,312 @@
+---
+title: 'Project 1: RNAseq Pipeline Notebook'
+author: "Sydney Sorbello"
+output:
+  html_document:
+    df_print: paged
+---
+
+### MultiQC Discussion
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook for Project 1 RNAseq. In this notebook we will first inspect the MultiQC results for quality. Next we can start our analysis by filtering the counts matrix. Then we will perform differential expression analysis and fgsea.
+
+Let's look at the [MultiQC Analysis](https://scc-ondemand1.bu.edu/rnode/scc-wi1/61978/file_show?path=%2Fprojectnb%2Fbf528%2Fstudents%2Fsorbello%2Fproject-1-sydneysorbello%2Fresults%2Fmultiqc_report.html) and analyze for overall quality. The Alignment statistics show a very good alignment percentage in which all samples are over 98%. The STAR alignment also reveals an slightly abnormal number of reads for the sample 'control_rep_3'. This sample had a total of 118.9M reads whereas the other samples ranged from 84.5M to 106.9M. Although this is not necessarily a major red flag in the analysis, it is something we should take note of. Another indication that the STAR alignment was largley successful is that only a very small percentage of reads were mapped to too many loci or were un-mapped. 
+
+We can also look the the FastQC results for each sample. Since we are looking at RNAseq results, we expect to see a large number of duplicate reads. There is a good mix of single and duplicate reads for each sample, a good for for our results. FastQC also reveals the Sequence Quality Histograms. This feature allows us to look at the mean quality value across each base position in the read. For all of the samples we can see a high seqeunce quality across the reads. All of the samples also passed the per sequence quality score test. The per base sequence content test, however added a warning or failed the samples. This is most likely due to primer sequences that were used in the experiment, it does not indicate poor quality for an RNAseq experiment. Looking at the GC content we see roughly 50% on each of the samples; aligned with what is expected. 
+
+When looking at the top over-represented sequences, we can see they each have reads in the hundreds of thousands. The top over-represented sequence: 'ATCGGAAGAGCACACGTCTGAACTCCAGTCACTAATACAGATCTCGTATG' was put into BLAST. Although it wasn't 100% identical to any gene, it shared 94.12% identity with a severe acute respiratory syndrome in Coronavirus 2 genome assembly. This may be an interesting find, but given every other quality measure looks ok, we can continue with analysis.
+
+### Filtering the Counts Matrix
+Please note: In the following Notebook we will be analyzing the verse_concat.csv matrix produced by Professor Orofino becuase my own raw counts matrix is corrupted. 
+
+First, install the necessary packages:
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(DESeq2)
+library(ggplot2)
+library(readr)
+```
+
+Let's take a look at the raw counts matrix:
+
+```{r}
+## read in the raw counts data
+raw_counts<-read.csv(file = '/projectnb/bf528/students/sorbello/project-1-sydneysorbello/results/verse_concat.csv')
+
+head(raw_counts)
+```
+
+Prior to filtering there are 63241 genes in the dataset:
+
+```{r}
+# find the number of genes by finding the dimensions of the matrix
+dim(raw_counts)
+```
+
+As we can see there's a some reads that have a count of zero for each sample. In order to filter the counts, we will remove genes that have zero counts.
+
+```{r}
+# now we filter the raw counts
+filtered_counts <- raw_counts %>%
+  filter(
+    rowSums(across(-1)) != 0, # if a gene has zero counts across all samples it will be removed
+    rowMeans(across(-1)) >= 1 # if the average count across the samples for a gene is less than 1 it is removed
+  )
+
+head(filtered_counts)
+```
+
+After filtering there are 30150 genes left in the dataset:
+
+```{r}
+# we can find the number of genes left using the dimension
+dim(filtered_counts)
+```
+
+### Differential Expression Analysis
+##### Running DESeq2 
+In order to perform differential expression analysis with DESeq2, we need to correctly format the inputs:
+
+```{r}
+## the conditions in the condition vector are in the same order as found in the counts matrix
+condition <- c("experimental", "control", "control", "experimental", "experimental", "control")
+
+# we want to create a counts matrix where the rownames are recognized as the gene names
+count_matrix <- filtered_counts %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# we also create an item storing the conditions in their specific order
+sample_conditions <- data.frame(
+  sample = colnames(count_matrix),
+  condition = condition
+) %>%
+  column_to_rownames("sample")
+```
+
+Now let's create the dataset for DESeq2:
+
+```{r}
+# now we can create data containing the count data, and the sample data
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = sample_conditions,
+  design = ~ condition
+)
+
+# and we run it through DESeq2
+dds <- DESeq(dds)
+```
+
+
+```{r}
+# let's format the results and take a closer look
+res <- results(dds)
+res <- res %>%
+  as.data.frame() %>%
+  filter(!is.na(padj)) ## remove genes that have NA for padj
+head(res)
+```
+Let's convert the table to a dataframe and add convert the rownames to its own column with the column name "ENSEMBL".
+
+```{r}
+library(tibble)
+res_df<-as.data.frame.matrix(res) 
+res_df <- tibble::rownames_to_column(res_df, "ENSEMBL") #make the rownames a column called "ENSEMBL"
+```
+
+
+Now that we have the dataframe, we should add the gene names to the table. We already have this information stored in the file 'parsed_gtf.tsv'.
+```{r}
+# we already have a tsv storing the converted ENSEMBL and SYMBOL gene names
+gene_symbol<-readr::read_tsv("/projectnb/bf528/students/sorbello/project-1-sydneysorbello/results/parsed_gtf.tsv")
+colnames(gene_symbol)<-c("ENSEMBL","SYMBOL")
+head(gene_symbol)
+```
+
+```{r}
+# lets join these tables on the ENSEMBL ID
+full_res <- merge(res_df, gene_symbol, by.x="ENSEMBL", by.y="ENSEMBL")
+
+print(head(full_res))
+```
+
+Take a look at the 10 most significant genes:
+
+```{r}
+res_ordered <- full_res[order(full_res$padj), ] ## oder the full result table
+head(res_ordered, 10)
+```
+
+##### Determine Significant Genes
+Let set the p-adjusted threshold to 0.05 and look at how many genes are significant. We choose 0.05 as it is a scientifically accepted threshold. With this threshold we have 1015 significant genes.
+```{r}
+# lets filter for only the significant genes
+signif_genes <- full_res[full_res$padj<0.05, ]
+signif_genes<-na.omit(signif_genes) # here we remove the NA values
+head(signif_genes)
+```
+
+##### Run EnrichR
+Now that we have determined the significant genes, let's run enrichR to determine pathways of interest. Call the package, if you do not already have the sftware installed, you may need to install it. 
+```{r}
+library(enrichR)
+```
+
+And connect to the enrichR database:
+```{r}
+# this module establishes a conneciton with the enrichR database
+websiteLive <- getOption("enrichR.live")
+
+if (websiteLive) {
+    listEnrichrSites()
+    setEnrichrSite("Enrichr") # Human genes
+}
+if (websiteLive) {
+    dbs <- listEnrichrDbs()
+    head(dbs)
+}
+```
+
+Select the Go databases, and create the gene list for significant genes:
+```{r}
+# we want to look at the processes and annotated function from the gene ontology (GO) terms
+# here we select those databases
+dbs <- c("GO_Molecular_Function_2023", "GO_Cellular_Component_2023", 
+     "GO_Biological_Process_2023")
+
+# here we are designating the list of genes to a variable
+gene_list<-signif_genes$SYMBOL
+head(gene_list)
+```
+
+And run it through the database:
+```{r}
+# we now query the database with the desired GO terms and gene list
+if (websiteLive) {
+    enriched <- enrichr(gene_list, dbs)
+}
+```
+And we can look at the results:
+```{r}
+# and we take a look at the results
+if (websiteLive) head(enriched[["GO_Biological_Process_2023"]], 10)
+```
+
+The results of of the enrichR analysis are interesting. There is a large amount of pathways related to regulation. There is both positive and negative regulation of blood coagulation. There are also multiple pathways related to fibrinolysis pathways. Finally there are multiple pathways related to the extracellular matrix. 
+
+### RNA-seq QC Plots
+
+##### Normalize the Counts Matrix
+
+Before we can produce perform Principal Component Analysis or create a heatmap, we need to normalize the counts matrix. We can do this using the DESeq2 dataset and rlog.
+
+```{r}
+# here we use rlog to produce a normalized matrix
+norm_counts <- rlog(dds, blind=FALSE)
+head(assay(norm_counts))
+```
+
+##### PCA Analysis
+Perform PCA on the dataframe:
+```{r}
+# vst is another way of calculating a normalized matrix, it is different from rlog but is far easier to produce a PCA plot from
+vsd<-vst(dds)
+
+# we can now plot the PCA using plotPCA
+plotPCA(vsd, intgroup="condition")
+```
+##### Heatmap
+
+Let's visualize these results further with a heatmap. We will use pheatmap and DESeq2.
+
+```{r}
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+
+# Compute sample-to-sample distances using rlog-transformed data
+sample_dists <- dist(t(assay(norm_counts)))  # transpose to get distances between columns/samples
+
+# Convert the distance object to a matrix
+sample_dist_matrix <- as.matrix(sample_dists)
+
+# Optional: assign nice row/col names
+rownames(sample_dist_matrix) <- colnames(norm_counts)
+colnames(sample_dist_matrix) <- colnames(norm_counts)
+
+# Make the heatmap
+pheatmap(sample_dist_matrix,
+         clustering_distance_rows = sample_dists,
+         clustering_distance_cols = sample_dists,
+         main = "Sample-to-Sample Distance Heatmap",
+         fontsize_number = 8,          # controls size of distance numbers
+         legend = TRUE,                # legend is TRUE by default
+         color = colorRampPalette(rev(brewer.pal(9, "Blues")))(100))  # prettier colors
+```
+
+
+##### QC Plot Analysis
+The PCA looks very prmosing as it is able to seperate the control and experimental conditions distinctly. PC1 is estimated to account for 86% of the difference between samples, and PC2 is estimated to account for 10% of the difference. We can see there are two experimental samples that are closely clustered together both for PC1 and PC2. However, the other experimental samples is not clustered tightly with the others for either principal components. This may be cause for concern, and it may point to a variety of experimental complications. In contrast all of the control samples cluster very tighly with each other for both principal components. 
+
+The heatmap further corroborates our findings with the PCA. All of the control samples are highly similary to each other, as indicated by the darker coloring of their tiles. For the experimental samples, there are two that are highly similar and a thrid that is less so. All in all, these quality control plots are reassuring for our analysis. 
+
+### FGSEA Analysis
+
+After look at the quality control plots and differential expression we can also take a look at up-regulated or down-regulated pathways. We can do this through GSEA, gene set enrichment analysis. 
+
+The ranking metric we will use is the Log2 Fold Change ranked by significance. This is a very standard ranking method with little to no bias. 
+```{r}
+ ranks <- signif_genes %>%
+  as.data.frame() %>%
+  filter(!is.na(log2FoldChange), !is.na(SYMBOL)) %>%
+  arrange(desc(log2FoldChange)) %>%
+  dplyr::select(SYMBOL, log2FoldChange) %>%
+  deframe()  # SYMBOL becomes names
+
+head(names(ranks))
+```
+
+We load the C2 Canonical Pathways. These pathways will map the genes and their expression to their related pathways.
+```{r}
+library(fgsea)
+library(msigdbr)
+
+# Alternatively, you can get MSigDB sets programmatically:
+msigdb_c2 <- msigdbr(species = "Homo sapiens", category = "C2") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+```
+
+Finally, let's run FGSEA on our dataset:
+```{r}
+fgseaRes <- fgsea(pathways = msigdb_c2,
+                  stats    = ranks,
+                  minSize  = 15,
+                  maxSize  = 500)
+```
+
+Let's visualize the FGSEA!
+
+```{r}
+# Filter top pathways by padj
+topPathways <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(padj) %>%
+  filter(padj < 0.3) %>%
+  head(10)  # Top 10 most significant
+
+# Plot!
+ggplot(topPathways, aes(x = reorder(pathway, NES), y = NES, fill = NES)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  labs(title = "Top Enriched Pathways",
+       x = "Pathway",
+       y = "Normalized Enrichment Score (NES)") +
+  theme_minimal()
+```
+
+### Interesting Biology
+
+The top up-regulated pathways are associated with Pancreatic Cancer, Breast Cancer Luminal v Basal, and Nasopharyngeal Carcinoma. There are a high number of upregulated pathways related to cancer. In addition to these pathways we see an upregulation in extracellular matrix organization which is also consistent with seen in the cancer biology. If we are looking at research concerning cancer biology there is a lot of data to unpack. 
